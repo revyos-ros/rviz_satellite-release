@@ -2,22 +2,10 @@
 Changelog for package rviz_satellite
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-3.1.0 (2023-02-20)
+4.0.0 (2023-02-20)
 ------------------
-* Add possibility to specify TF frames as position reference in UTM mode.
-* Turn map and UTM selection UI into TfFrameProperty.
-* Simplify UTM frame mode integration.
-* Improved map transform type wording.
-* Added UTM frame mode.
-* Added option to configure the map frame.
-* Added missing header file
-
-3.0.3 (2021-01-19)
-------------------
-* Pragmatic URI check
-* Enable catkin_lint in CI
-* Enable ros industrial CI
-* Update maintainer info
+* ROS2 support!
+* Contributors: Lee Hicks, Marcel Zeilinger, Tim Clephas, Vitaliy Bondar, ceranit
 
 3.0.2 (2020-10-13)
 ------------------

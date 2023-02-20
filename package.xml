@@ -1,35 +1,30 @@
 <?xml version="1.0"?>
-<package>
+<package format="3">
   <name>rviz_satellite</name>
-  <version>3.1.0</version>
+  <version>4.0.0</version>
   <description>Display satellite map tiles in RViz</description>
-  <url>https://github.com/nobleo/rviz_satellite</url>
-
   <author email="gcross.code@icloud.com">Gareth Cross</author>
-  <author email="andre.schroeder@tomtom.com">Andre Schröder</author>
-
-  <maintainer email="tim.clephas@nobleo.nl">Tim Clephas</maintainer>
-
+  <maintainer email="andre.schroeder@tomtom.com">Andre Schröder</maintainer>
+  <maintainer email="marcel.zeilinger@ait.ac.at">Marcel Zeilinger</maintainer>
   <license>Apache 2</license>
 
-  <buildtool_depend>catkin</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <build_depend>geographiclib</build_depend>
+  <depend>rclcpp</depend>
+  <depend>rcpputils</depend>
+  <depend>rviz_common</depend>
+  <depend>rviz_default_plugins</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>angles</depend>
+
   <build_depend>qtbase5-dev</build_depend>
-  <build_depend>roscpp</build_depend>
-  <build_depend>rviz</build_depend>
-  <build_depend>sensor_msgs</build_depend>
-  <build_depend>tf2</build_depend>
-  <build_depend>tf2_geometry_msgs</build_depend>
 
-  <run_depend>geographiclib</run_depend>
-  <run_depend>roscpp</run_depend>
-  <run_depend>rviz</run_depend>
-  <run_depend>sensor_msgs</run_depend>
-  <run_depend>tf2</run_depend>
-  <run_depend>tf2_ros</run_depend>
-
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
   <export>
-      <rviz plugin="${prefix}/plugin_description.xml"/>
+    <rviz plugin="plugin_description.xml"/>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>

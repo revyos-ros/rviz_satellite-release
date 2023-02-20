@@ -11,39 +11,32 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
+#include "aerialmap_display.hpp"
+#include "field.hpp"
 
-#include <OGRE/OgreManualObject.h>
-#include <OGRE/OgreMaterialManager.h>
-#include <OGRE/OgreSceneManager.h>
-#include <OGRE/OgreSceneNode.h>
-#include <OGRE/OgreTextureManager.h>
-#include <OGRE/OgreTechnique.h>
+#include <limits>
+#include <algorithm>
+#include <utility>
+#include <string>
 
-#include <GeographicLib/UTMUPS.hpp>
+#include <OgreManualObject.h>
+#include <OgreMaterialManager.h>
+#include <OgreSceneManager.h>
+#include <OgreSceneNode.h>
+#include <OgreTextureManager.h>
+#include <OgreTechnique.h>
 
-#include "rviz/display_context.h"
-#include "rviz/frame_manager.h"
-#include "rviz/properties/enum_property.h"
-#include "rviz/properties/float_property.h"
-#include "rviz/properties/int_property.h"
-#include "rviz/properties/property.h"
-#include "rviz/properties/ros_topic_property.h"
-#include "rviz/properties/string_property.h"
-#include "rviz/properties/tf_frame_property.h"
+#include <rcpputils/asserts.hpp>
+#include "rviz_common/validate_floats.hpp"
+#include "rviz_common/display_context.hpp"
+#include "rviz_common/logging.hpp"
+#include "rviz_common/msg_conversions.hpp"
 
-#include <tf2/LinearMath/Vector3.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include "rviz_default_plugins/transformation/tf_wrapper.hpp"
 
-#include "aerialmap_display.h"
-#include "mercator.h"
-#include "position_reference_property.h"
-
-#include <regex>
-#include <unordered_map>
-
-
-namespace rviz
+namespace rviz_satellite
 {
+
 /**
  * @file
  * The sequence of events is rather complex due to the asynchronous nature of the tile texture updates, and the
@@ -56,1203 +49,521 @@ namespace rviz
  * Splitting this transform lookup is necessary to mitigate frame jitter.
  */
 
-std::unordered_map<MapTransformType, QString> mapTransformTypeStrings =
+using rviz_common::properties::Property;
+using rviz_common::properties::FloatProperty;
+using rviz_common::properties::IntProperty;
+using rviz_common::properties::RosTopicProperty;
+using rviz_common::properties::StringProperty;
+using rviz_common::properties::StatusProperty;
+
+using sensor_msgs::msg::NavSatFix;
+
+// disable cpplint: not using string as const char*
+// declaring as std::string and QString to avoid copies
+const std::string AerialMapDisplay::MAP_FRAME = "map"; // NOLINT
+const QString AerialMapDisplay::MESSAGE_STATUS = "Message"; // NOLINT
+const QString AerialMapDisplay::TILE_REQUEST_STATUS = "TileRequest"; // NOLINT
+const QString AerialMapDisplay::PROPERTIES_STATUS = "Properties"; // NOLINT
+const QString AerialMapDisplay::ORIENTATION_STATUS = "Orientation"; // NOLINT
+const QString AerialMapDisplay::TRANSFORM_STATUS = "Transform"; // NOLINT
+
+AerialMapDisplay::AerialMapDisplay()
+: RosTopicDisplay()
 {
-  {MapTransformType::VIA_MAP_FRAME, "NavSatFix Messages and Map Frame"},
-  {MapTransformType::VIA_UTM_FRAME, "Explicit UTM Frame"},
-};
-
-AerialMapDisplay::AerialMapDisplay() : Display()
-{
-  center_tile_pose_.pose.orientation.w = 1;
-
-  topic_property_ =
-      new RosTopicProperty("Topic", "", QString::fromStdString(ros::message_traits::datatype<sensor_msgs::NavSatFix>()),
-                           "sensor_msgs::NavSatFix topic to subscribe to.", this, SLOT(updateTopic()));
-
-  map_transform_type_property_ =
-      new EnumProperty("Map transform type", mapTransformTypeStrings[MapTransformType::VIA_MAP_FRAME],
-                       "Whether to transform tiles via map frame and fix messages or via UTM frame",
-                       this, SLOT(updateMapTransformType()));
-  map_transform_type_property_->addOption(mapTransformTypeStrings[MapTransformType::VIA_MAP_FRAME],
-                                          static_cast<int>(MapTransformType::VIA_MAP_FRAME));
-  map_transform_type_property_->addOption(mapTransformTypeStrings[MapTransformType::VIA_UTM_FRAME],
-                                          static_cast<int>(MapTransformType::VIA_UTM_FRAME));
-  map_transform_type_property_->setShouldBeSaved(true);
-  map_transform_type_ = static_cast<MapTransformType>(map_transform_type_property_->getOptionInt());
-  
-  map_frame_property_ = new TfFrameProperty(
-      "Map Frame", "map", "Frame ID of the map.", this, nullptr, false, SLOT(updateMapFrame()));
-  map_frame_property_->setShouldBeSaved(true);
-  map_frame_ = map_frame_property_->getFrameStd();
-  
-  utm_frame_property_ = new TfFrameProperty(
-      "UTM Frame", "utm", "Frame ID of the UTM frame.", this, nullptr, false, SLOT(updateUtmFrame()));
-  utm_frame_property_->setShouldBeSaved(true);
-  utm_frame_ = utm_frame_property_->getFrameStd();
-  
-  utm_zone_property_ =
-      new IntProperty("UTM Zone", GeographicLib::UTMUPS::STANDARD, "UTM zone (-1 means autodetect).",
-                      this, SLOT(updateUtmZone()));
-  utm_zone_property_->setMin(GeographicLib::UTMUPS::STANDARD);
-  utm_zone_property_->setMax(GeographicLib::UTMUPS::MAXZONE);
-  utm_zone_property_->setShouldBeSaved(true);
-  utm_zone_ = utm_zone_property_->getInt();
-
-  xy_reference_property_ =
-      new PositionReferenceProperty("XY Reference", PositionReferenceProperty::FIX_MSG_STRING,
-                                    "How to determine XY coordinates that define the displayed tiles.",
-                                    this, nullptr, SLOT(updateXYReference()));
-  xy_reference_property_->setShouldBeSaved(true);
-  xy_reference_type_ = PositionReferenceType::NAV_SAT_FIX_MESSAGE;
-  
-  z_reference_property_ =
-      new PositionReferenceProperty("Z Reference", PositionReferenceProperty::FIX_MSG_STRING,
-                                    "How to determine height of the displayed tiles.",
-                                    this, nullptr, SLOT(updateZReference()));
-  z_reference_property_->setShouldBeSaved(true);
-  z_reference_type_ = PositionReferenceType::NAV_SAT_FIX_MESSAGE;
-  
   alpha_property_ =
-      new FloatProperty("Alpha", 0.7, "Amount of transparency to apply to the map.", this, SLOT(updateAlpha()));
+    new FloatProperty(
+    "Alpha", 0.7, "Amount of transparency to apply to the map.", this,
+    SLOT(updateAlpha()));
   alpha_property_->setMin(0);
   alpha_property_->setMax(1);
   alpha_property_->setShouldBeSaved(true);
-  alpha_ = alpha_property_->getValue().toFloat();
 
-  draw_under_property_ = new Property("Draw Behind", false,
-                                      "Rendering option, controls whether or not the map is always"
-                                      " drawn behind everything else.",
-                                      this, SLOT(updateDrawUnder()));
+  draw_under_property_ = new Property(
+    "Draw Behind", false,
+    "Rendering option, controls whether or not the map is always"
+    " drawn behind everything else.",
+    this, SLOT(updateDrawUnder()));
   draw_under_property_->setShouldBeSaved(true);
-  draw_under_ = draw_under_property_->getValue().toBool();
 
   // properties for map
   tile_url_property_ =
-      new StringProperty("Object URI", "", "URL from which to retrieve map tiles.", this, SLOT(updateTileUrl()));
+    new StringProperty(
+    "Object URI", "", "URL from which to retrieve map tiles.", this,
+    SLOT(updateTileUrl()));
   tile_url_property_->setShouldBeSaved(true);
-  tile_url_ = tile_url_property_->getStdString();
 
-  QString const zoom_desc = QString::fromStdString("Zoom level (0 - " + std::to_string(MAX_ZOOM) + ")");
+  QString const zoom_desc = QString::fromStdString(
+    "Zoom level (0 - " + std::to_string(
+      MAX_ZOOM) + ")");
   zoom_property_ = new IntProperty("Zoom", 16, zoom_desc, this, SLOT(updateZoom()));
   zoom_property_->setMin(0);
   zoom_property_->setMax(MAX_ZOOM);
   zoom_property_->setShouldBeSaved(true);
-  zoom_ = zoom_property_->getInt();
 
-  QString const blocks_desc = QString::fromStdString("Adjacent blocks (0 - " + std::to_string(MAX_BLOCKS) + ")");
+  QString const blocks_desc =
+    QString::fromStdString("Adjacent blocks (0 - " + std::to_string(MAX_BLOCKS) + ")");
   blocks_property_ = new IntProperty("Blocks", 3, blocks_desc, this, SLOT(updateBlocks()));
   blocks_property_->setMin(0);
   blocks_property_->setMax(MAX_BLOCKS);
   blocks_property_->setShouldBeSaved(true);
-  blocks_ = blocks_property_->getInt();
-  
-  z_offset_property_ =
-      new FloatProperty("Z Offset", 0.0, "Offset in Z direction (in meters).", this, SLOT(updateZOffset()));
-  z_offset_property_->setShouldBeSaved(true);
-  z_offset_ = z_offset_property_->getValue().toFloat();
-  
-  tf_reference_update_duration_ = {1, 0};
-  tf_reference_update_timer_ = threaded_nh_.createTimer(
-      tf_reference_update_duration_, &AerialMapDisplay::tfReferencePeriodicUpdate, this);
+
+  timeout_property_ =
+    new FloatProperty(
+    "Timeout", 3.0,
+    "Message header timestamp timeout in seconds. Will start to fade out at half time, ignored if 0.",
+    this);
+  timeout_property_->setMin(0.0);
+  timeout_property_->setShouldBeSaved(true);
+
+  tf_tolerance_property_ =
+    new FloatProperty(
+    "TF tolerance", 0.1,
+    "Maximum allowed age of latest transformation looked up from TF.",
+    this);
+  tf_tolerance_property_->setMin(0.0);
+  tf_tolerance_property_->setShouldBeSaved(true);
 }
 
 AerialMapDisplay::~AerialMapDisplay()
 {
-  unsubscribe();
-  clearAll();
 }
 
 void AerialMapDisplay::onInitialize()
 {
-  tf_buffer_ = context_->getFrameManager()->getTF2BufferPtr();
-  map_frame_property_->setFrameManager(context_->getFrameManager());
-  utm_frame_property_->setFrameManager(context_->getFrameManager());
-  xy_reference_property_->setFrameManager(context_->getFrameManager());
-  z_reference_property_->setFrameManager(context_->getFrameManager());
-  updateMapTransformType();
+  RTDClass::onInitialize();
 }
 
 void AerialMapDisplay::onEnable()
 {
-  createTileObjects();
-  subscribe();
+  scene_node_->setVisible(true);
 }
 
 void AerialMapDisplay::onDisable()
 {
-  unsubscribe();
-  clearAll();
+  scene_node_->setVisible(false);
+  resetTileServerError();
+  resetMap();
 }
 
-void AerialMapDisplay::subscribe()
+bool AerialMapDisplay::validateMessage(const NavSatFix::ConstSharedPtr message)
 {
-  if (!isEnabled())
+  bool message_is_valid = true;
+  if (!rviz_common::validateFloats(message->latitude) ||
+    !rviz_common::validateFloats(message->longitude))
   {
-    return;
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, MESSAGE_STATUS,
+      "Message contains invalid floating point values (nans or infs)");
+    message_is_valid = false;
   }
-
-  if (!topic_property_->getTopic().isEmpty())
-  {
-    try
-    {
-      ROS_INFO("Subscribing to %s", topic_property_->getTopicStd().c_str());
-      navsat_fix_sub_ =
-          update_nh_.subscribe(topic_property_->getTopicStd(), 1, &AerialMapDisplay::navFixCallback, this);
-
-      setStatus(StatusProperty::Ok, "Topic", "OK");
-    }
-    catch (ros::Exception& e)
-    {
-      setStatus(StatusProperty::Error, "Topic", QString("Error subscribing: ") + e.what());
-    }
+  if (message->status.status == sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, MESSAGE_STATUS,
+      "NavSatFix status NO_FIX");
+    message_is_valid = false;
   }
+  return message_is_valid;
 }
 
-void AerialMapDisplay::unsubscribe()
+bool AerialMapDisplay::validateProperties()
 {
-  navsat_fix_sub_.shutdown();
+  if (tile_url_property_->getStdString().empty()) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, PROPERTIES_STATUS,
+      "Object URI is required to fetch map tiles");
+    return false;
+  }
+  return true;
 }
 
 void AerialMapDisplay::updateAlpha()
 {
-  // if draw_under_ texture property changed, we need to
-  //  - repaint textures
-  // we don't need to
-  //  - query textures
-  //  - re-create tile grid geometry
-  //  - update the center tile
-  //  - update transforms
-
-  auto const alpha = alpha_property_->getFloat();
-  if (alpha == alpha_)
-  {
-    return;
-  }
-
-  alpha_ = alpha;
-
-  if (!isEnabled())
-  {
-    return;
-  }
-
-  triggerSceneAssembly();
+  auto t = rviz_ros_node_.lock()->get_raw_node()->get_clock()->now();
+  updateAlpha(t);
 }
 
 void AerialMapDisplay::updateDrawUnder()
 {
-  // if draw_under_ texture property changed, we need to
-  //  - repaint textures
-  // we don't need to
-  //  - query textures
-  //  - re-create tile grid geometry
-  //  - update the center tile
-  //  - update transforms
-
-  auto const draw_under = draw_under_property_->getValue().toBool();
-  if (draw_under == draw_under_)
-  {
-    return;
+  for (auto & tile : tiles_) {
+    auto & object = tile.second;
+    if (draw_under_property_->getValue().toBool()) {
+      object.setRenderQueueGroup(Ogre::RENDER_QUEUE_3);
+    } else {
+      object.setRenderQueueGroup(Ogre::RENDER_QUEUE_MAIN);
+    }
   }
-
-  draw_under_ = draw_under;
-
-  if (!isEnabled())
-  {
-    return;
-  }
-
-  triggerSceneAssembly();
 }
 
 void AerialMapDisplay::updateTileUrl()
 {
-  // if the tile url changed, we need to
-  //  - query textures
-  //  - repaint textures
-  // we don't need to
-  //  - re-create tile grid geometry
-  //  - update the center tile
-  //  - update transforms
-
-  auto const tile_url = tile_url_property_->getStdString();
-  if (tile_url == tile_url_)
-  {
-    return;
-  }
-
-  // Check for valid url: https://stackoverflow.com/a/38608262
-  if (!std::regex_match(tile_url, std::regex(R"(^(https?:\/\/).*)")))
-  {
-    ROS_ERROR("Invalid Object URI: %s", tile_url.c_str());
-    // Still setting the url since keeping the old is probably unexpected
-  }
-  else if (!std::regex_match(tile_url, std::regex(R"(.*\{[xyz]\}.*)")))
-  {
-    ROS_ERROR("No coordinates ({x}, {y} or {z}) found in URI: %s", tile_url.c_str());
-  }
-
-  tile_url_ = tile_url;
-
-  if (!isEnabled())
-  {
-    return;
-  }
-
-  requestTileTextures();
+  // updated tile url may work
+  resetTileServerError();
+  // rebuild on next received message
+  resetMap();
 }
 
 void AerialMapDisplay::updateZoom()
 {
-  // if the zoom changed, we need to
-  //  - re-create tile grid geometry
-  //  - update the center tile
-  //  - query textures
-  //  - repaint textures
-  //  - update transforms
-
-  auto const zoom = zoom_property_->getInt();
-  if (zoom == zoom_)
-  {
-    return;
-  }
-
-  zoom_ = zoom;
-
-  if (!isEnabled())
-  {
-    return;
-  }
-
-  createTileObjects();
-
-  if (ref_fix_)
-  {
-    updateCenterTile(ref_fix_);
-  }
+  // updated zoom may be supported by this tile server
+  resetTileServerError();
+  // rebuild on next received message
+  resetMap();
 }
 
 void AerialMapDisplay::updateBlocks()
 {
-  // if the number of blocks changed, we need to
-  //  - re-create tile grid geometry
-  //  - query textures
-  //  - repaint textures
-  // we don't need to
-  //  - update the center tile
-  //  - update transforms
-
-  auto const blocks = blocks_property_->getInt();
-  if (blocks == blocks_)
-  {
-    return;
-  }
-
-  blocks_ = blocks;
-
-  if (!isEnabled())
-  {
-    return;
-  }
-
-  createTileObjects();
-  requestTileTextures();
+  // rebuild on next received message
+  resetMap();
 }
 
-void AerialMapDisplay::updateTopic()
+void AerialMapDisplay::processMessage(const NavSatFix::ConstSharedPtr msg)
 {
-  // if the NavSat topic changes, we reset everything
-
-  if (!isEnabled())
-  {
+  if (!isEnabled()) {
+    // if not enabled, don't incur network traffic
     return;
   }
-
-  unsubscribe();
-  clearAll();
-  createTileObjects();
-  subscribe();
-}
-
-void AerialMapDisplay::updateMapTransformType()
-{
-  // if the map transform type changed, we need to
-  //  - enable/disable map/utm frame inputs
-  //  - update XY and Z reference settings to only use values valid for the given mode
-  //  - query textures
-  //  - repaint textures
-  //  - reset and update the center tile
-  //  - update transforms
-  // we don't need to
-  //  - re-create tile grid geometry
-
-  auto const map_transform_type = static_cast<MapTransformType>(map_transform_type_property_->getOptionInt());
-
-  map_transform_type_ = map_transform_type;
-  
-  switch (map_transform_type_)
-  {
-    case MapTransformType::VIA_MAP_FRAME:
-      utm_frame_property_->hide();
-      utm_zone_property_->hide();
-      map_frame_property_->show();
-      break;
-    case MapTransformType::VIA_UTM_FRAME:
-      utm_frame_property_->show();
-      utm_zone_property_->show();
-      map_frame_property_->hide();
-      break;
+  if (!validateMessage(msg)) {
+    return;
+  } else {
+    setStatus(
+      rviz_common::properties::StatusProperty::Ok, MESSAGE_STATUS,
+      "Message OK");
   }
-
-  updateXYReference();
-  updateZReference();
-  
-  if (ref_fix_)
-  {
-    updateCenterTile(ref_fix_);
-  }
-}
-
-void AerialMapDisplay::updateMapFrame()
-{
-  // if the map frame changed, we need to
-  //  - query textures
-  //  - repaint textures
-  //  - reset and update the center tile
-  //  - update transforms
-  // we don't need to
-  //  - re-create tile grid geometry
-
-  auto const map_frame = map_frame_property_->getFrameStd();
-  if (map_frame == map_frame_)
-  {
+  if (tile_server_had_errors_) {
     return;
   }
-
-  map_frame_ = map_frame;
-
-  if (!isEnabled())
-  {
+  last_fix_ = msg;
+  if (!validateProperties()) {
     return;
+  } else {
+    deleteStatus(PROPERTIES_STATUS);
   }
-
-  if (ref_fix_)
+  auto zoom = zoom_property_->getInt();
+  auto tile_at_fix = fromWGS(*msg, zoom);
   {
-    updateCenterTile(ref_fix_);
-  }
-}
-
-void AerialMapDisplay::updateUtmFrame()
-{
-  // if the UTM frame changed, we need to
-  //  - query textures
-  //  - repaint textures
-  //  - reset and update the center tile
-  //  - update transforms
-  // we don't need to
-  //  - re-create tile grid geometry
-
-  auto const utm_frame = utm_frame_property_->getFrameStd();
-  if (utm_frame == utm_frame_)
-  {
-    return;
-  }
-
-  utm_frame_ = utm_frame;
-
-  if (!isEnabled())
-  {
-    return;
-  }
-
-  if (ref_fix_)
-  {
-    updateCenterTile(ref_fix_);
-  }
-}
-
-void AerialMapDisplay::updateUtmZone()
-{
-  // if the UTM zone changed, we need to
-  //  - query textures
-  //  - repaint textures
-  //  - reset and update the center tile
-  //  - update transforms
-  // we don't need to
-  //  - re-create tile grid geometry
-
-  auto const utm_zone = utm_zone_property_->getInt();
-  if (utm_zone == utm_zone_)
-  {
-    return;
-  }
-
-  utm_zone_ = utm_zone;
-
-  if (!isEnabled())
-  {
-    return;
-  }
-
-  if (ref_fix_)
-  {
-    updateCenterTile(ref_fix_);
-  }
-}
-
-void AerialMapDisplay::updateXYReference()
-{
-  // if the XY reference changed, we need to
-  //  - query textures
-  //  - repaint textures
-  //  - reset and update the center tile
-  //  - update transforms
-  // we don't need to
-  //  - re-create tile grid geometry
-
-  const auto old_reference_type = xy_reference_type_;
-  const auto old_reference_frame = xy_reference_frame_;
-
-  switch (map_transform_type_)
-  {
-    case MapTransformType::VIA_MAP_FRAME:
-      xy_reference_type_ = PositionReferenceType::NAV_SAT_FIX_MESSAGE;
-      xy_reference_frame_ = "";
-      xy_reference_property_->hide();
-      break;
-    case MapTransformType::VIA_UTM_FRAME:
-      xy_reference_type_ = xy_reference_property_->getPositionReferenceType();
-      xy_reference_frame_ = xy_reference_property_->getFrameStd();
-      xy_reference_property_->show();
-      if (xy_reference_type_ == PositionReferenceType::TF_FRAME && xy_reference_frame_ == utm_frame_)
-      {
-        ROS_WARN_THROTTLE(2.0, "Setting UTM frame '%s' as XY reference is invalid, as the computed easting and "
-                               "northing of zero is out of bounds. Select a different frame.", utm_frame_.c_str());
+    const std::lock_guard<std::mutex> lock(tiles_mutex_);
+    try {
+      double tile_size_m = zoomSize(msg->latitude, zoom);
+      if (tiles_.empty()) {
+        // create whole map initially
+        buildMap(tile_at_fix, tile_size_m);
+      } else {
+        auto center = centerTile();
+        auto offset = Ogre::Vector2i(tile_at_fix.x - center.x, tile_at_fix.y - center.y);
+        if (!offset.isZeroLength()) {
+          auto blocks = blocks_property_->getInt();
+          if (blocks > 0 && std::abs(offset.data[0]) <= blocks &&
+            std::abs(offset.data[1]) <= blocks)
+          {
+            // if center tile changed to some index direction, within the bounds of the surrounding blocks,
+            // create only the missing tiles
+            shiftMap(center, offset, tile_size_m);
+          } else {
+            // if more tiles than blocks are skipped, recreate the entire map
+            pending_tiles_.clear();
+            tiles_.clear();
+            buildMap(tile_at_fix, tile_size_m);
+          }
+        }
       }
-      break;
-  }
-  
-  if (!isEnabled() || (old_reference_type == xy_reference_type_ && old_reference_frame == xy_reference_frame_))
-  {
-    return;
-  }
-  
-  if (xy_reference_type_ != PositionReferenceType::TF_FRAME)
-  {
-    deleteStatus("UTM");
-    deleteStatus("XY Reference Transform");
-    deleteStatus("XY reference UTM conversion");
-  }
-  
-  if (ref_fix_)
-  {
-    updateCenterTile(ref_fix_);
-  }
-}
-
-void AerialMapDisplay::updateZReference()
-{
-  // if the Z reference changed, we need to
-  //  - update transforms
-  // we don't need to
-  //  - re-create tile grid geometry
-  //  - query textures
-  //  - repaint textures
-  //  - reset and update the center tile
-
-  const auto old_reference_type = z_reference_type_;
-  const auto old_reference_frame = z_reference_frame_;
-
-  switch (map_transform_type_)
-  {
-    case MapTransformType::VIA_MAP_FRAME:
-      z_reference_type_ = PositionReferenceType::NAV_SAT_FIX_MESSAGE;
-      z_reference_frame_ = "";
-      z_reference_property_->hide();
-      break;
-    case MapTransformType::VIA_UTM_FRAME:
-      z_reference_type_ = z_reference_property_->getPositionReferenceType();
-      z_reference_frame_ = z_reference_property_->getFrameStd();
-      z_reference_property_->show();
-      break;
-  }
-  
-  if (!isEnabled() || (old_reference_type == z_reference_type_ && old_reference_frame == z_reference_frame_))
-  {
-    return;
-  }
-  
-  if (z_reference_type_ != PositionReferenceType::TF_FRAME)
-  {
-    deleteStatus("Z Reference Transform");
-  }
-  
-  transformTileToReferenceFrame();
-}
-
-void AerialMapDisplay::updateZOffset()
-{
-  // if the Z offset changed, we don't need to do anything as the value is directly read in each update() call
-  
-  z_offset_ = z_offset_property_->getFloat();
-}
-
-void AerialMapDisplay::clearAll()
-{
-  ref_fix_ = nullptr;
-  center_tile_ = boost::none;
-  ref_coords_ = boost::none;
-  destroyTileObjects();
-
-  setStatus(StatusProperty::Warn, "Message", "No NavSatFix message received yet");
-}
-
-void AerialMapDisplay::destroyTileObjects()
-{
-  for (MapObject& obj : objects_)
-  {
-    // destroy object
-    scene_node_->detachObject(obj.object);
-    scene_manager_->destroyManualObject(obj.object);
-
-    // destroy material
-    if (!obj.material.isNull())
-    {
-      Ogre::MaterialManager::getSingleton().remove(obj.material->getName());
+    } catch (const tile_request_error & e) {
+      tile_server_had_errors_ = true;
+      pending_tiles_.clear();
+      tiles_.clear();
+      setStatus(rviz_common::properties::StatusProperty::Error, TILE_REQUEST_STATUS, e.what());
     }
   }
-  objects_.clear();
+  // set material properties on created tiles
+  updateAlpha(last_fix_->header.stamp);
+  updateDrawUnder();
 }
 
-void AerialMapDisplay::createTileObjects()
+void AerialMapDisplay::shiftMap(TileCoordinate center, Ogre::Vector2i offset, double tile_size_m)
 {
-  if (not objects_.empty())
-  {
-    destroyTileObjects();
+  int delta_x = offset.data[0];
+  int delta_y = offset.data[1];
+
+  // TODO(ZeilingerM) validate map borders
+  int blocks = blocks_property_->getInt();
+  auto tile_url = tile_url_property_->getStdString();
+
+  // remove tiles on the far end
+  for (auto far_offset : farEndOffsets(blocks, offset)) {
+    int x = center.x + far_offset.data[0];
+    int y = center.y + far_offset.data[1];
+    const TileCoordinate coordinate_to_delete{x, y, center.z};
+    const TileId tile_to_delete{tile_url, coordinate_to_delete};
+    auto erased = tiles_.erase(tile_to_delete);
+    // TODO(ZeilingerM) assertion is not correct on border of map
+    rcpputils::assert_true(erased == 1, "failed to erase tile at far end");
   }
 
-  for (int block = 0; block < (2 * blocks_ + 1) * (2 * blocks_ + 1); ++block)
-  {
-    // generate an unique name
-    static size_t count = 0;
-    std::string const name_suffix = std::to_string(count);
-    ++count;
-
-    // one material per texture
-    Ogre::MaterialPtr material = Ogre::MaterialManager::getSingleton().create(
-        "satellite_material_" + name_suffix, Ogre::ResourceGroupManager::DEFAULT_RESOURCE_GROUP_NAME);
-    material->setReceiveShadows(false);
-    material->getTechnique(0)->setLightingEnabled(false);
-    material->setDepthBias(-16.0f, 0.0f);
-    material->setCullingMode(Ogre::CULL_NONE);
-    material->setDepthWriteEnabled(false);
-
-    // create texture and initialize it
-    Ogre::TextureUnitState* tex_unit = material->getTechnique(0)->getPass(0)->createTextureUnitState();
-    tex_unit->setTextureFiltering(Ogre::TFO_BILINEAR);
-
-    // create an object
-    Ogre::ManualObject* obj = scene_manager_->createManualObject("satellite_object_" + name_suffix);
-    obj->setVisible(false);
-    scene_node_->attachObject(obj);
-
-    assert(!material.isNull());
-    objects_.emplace_back(obj, material);
+  // shift existing tiles to new center
+  Ogre::Vector3 translation(-delta_x * tile_size_m, delta_y * tile_size_m, 0.0);
+  for (auto & tile : tiles_) {
+    tile.second.translate(translation);
   }
+
+  // create tiles on the near end
+  for (auto near_offset : nearEndOffsets(blocks, offset)) {
+    int x = center.x + near_offset.data[0];
+    int y = center.y + near_offset.data[1];
+    TileCoordinate new_coordinate{x, y, center.z};
+    // set tile offset with the assumption of a new center
+    buildTile(new_coordinate, near_offset - offset, tile_size_m);
+  }
+}
+
+void AerialMapDisplay::buildMap(TileCoordinate center_tile, double size)
+{
+  int zoom = center_tile.z;
+  int number_of_tiles_per_dim = 1 << zoom;
+  auto blocks = blocks_property_->getInt();
+  for (int x = -blocks; x <= blocks; ++x) {
+    for (int y = -blocks; y <= blocks; ++y) {
+      int tile_x = center_tile.x + x;
+      int tile_y = center_tile.y + y;
+      if (tile_x < 0 || tile_x >= number_of_tiles_per_dim) {
+        continue;
+      }
+      if (tile_y < 0 || tile_y >= number_of_tiles_per_dim) {
+        continue;
+      }
+      buildTile({tile_x, tile_y, zoom}, Ogre::Vector2i(x, y), size);
+    }
+  }
+}
+
+void AerialMapDisplay::buildTile(TileCoordinate coordinate, Ogre::Vector2i offset, double size)
+{
+  auto tile_url = tile_url_property_->getStdString();
+  const TileId tile_id{tile_url, coordinate};
+  auto pending_emplace_result = pending_tiles_.emplace(tile_id, tile_client_.request(tile_id));
+  rcpputils::assert_true(pending_emplace_result.second, "failed to store tile request");
+
+  // position of each tile is set so the origin of the aerial map is the center of the middle tile
+  double tx = offset.data[0] * size - size / 2;
+  // while tiles follow a east-south coordinate system, the aerial map is displayed in ENU
+  // thus, we invert the y translation
+  double ty = -offset.data[1] * size - size / 2;
+  std::stringstream ss;
+  ss << tile_id;
+  auto tile_emplace_result =
+    tiles_.emplace(
+    std::piecewise_construct,
+    std::forward_as_tuple(tile_id),
+    std::forward_as_tuple(
+      scene_manager_, scene_node_,
+      ss.str(), size, tx, ty, false));
+  // hide until the tile request was completed
+  tile_emplace_result.first->second.setVisible(false);
+  rcpputils::assert_true(tile_emplace_result.second, "failed to store tile object");
+}
+
+// Try to get transform to fixed frame at given time, fallback to latest time within tolerance otherwise
+static void get_fixed_frame_transform_fallback_to_latest(
+  rviz_common::FrameManagerIface * frame_manager,
+  const std::string & frame_id,
+  const rclcpp::Time & t,
+  const rclcpp::Duration & tolerance,
+  Ogre::Vector3 & position,
+  Ogre::Quaternion & orientation)
+{
+  position = Ogre::Vector3::ZERO;
+  orientation = Ogre::Quaternion::IDENTITY;
+
+  // identity pose
+  geometry_msgs::msg::PoseStamped pose_in;
+  pose_in.header.stamp = t;
+  pose_in.header.frame_id = frame_id;
+
+  auto fixed_frame = frame_manager->getFixedFrame();
+  auto transformer = frame_manager->getTransformer();
+  geometry_msgs::msg::PoseStamped pose_out;
+  try {
+    pose_out = transformer->transform(pose_in, fixed_frame);
+  } catch (const rviz_common::transformation::FrameTransformerException & exception) {
+    pose_in.header.stamp = rclcpp::Time(0);
+    pose_out = transformer->transform(pose_in, fixed_frame);
+    rclcpp::Time latest_stamp = pose_out.header.stamp;
+    if (tolerance != rclcpp::Duration::from_nanoseconds(0)) {
+      if (latest_stamp < (t - tolerance)) {
+        throw;
+      }
+    }
+  }
+
+  position = rviz_common::pointMsgToOgre(pose_out.pose.position);
+  orientation = rviz_common::quaternionMsgToOgre(pose_out.pose.orientation);
 }
 
 void AerialMapDisplay::update(float, float)
 {
-  if (!ref_fix_ or !center_tile_)
-  {
+  std::unique_lock<std::mutex> lock(tiles_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    // if tiles are currently written to, just wait until the next update
     return;
   }
 
-  // update tiles, if necessary
-  assembleScene();
-  // transform scene object into fixed frame
-  transformMapTileToFixedFrame();
-}
-
-void AerialMapDisplay::navFixCallback(sensor_msgs::NavSatFixConstPtr const& msg)
-{
-  // reset the periodic update timer as we got an update right now
-  tf_reference_update_timer_.setPeriod(tf_reference_update_duration_);
-
-  updateCenterTile(msg);
-
-  setStatus(StatusProperty::Ok, "Message", "NavSatFix message received");
-}
-
-bool AerialMapDisplay::updateCenterTile(sensor_msgs::NavSatFixConstPtr const& msg)
-{
-  if (!isEnabled())
-  {
-    return false;
-  }
-
-  WGSCoordinate reference_wgs{};
-
-  // find the WGS lat/lon of the XY reference point
-  switch (xy_reference_type_)
-  {
-    case PositionReferenceType::NAV_SAT_FIX_MESSAGE: {
-      reference_wgs = { msg->latitude, msg->longitude };
-      break;
-    }
-    case PositionReferenceType::TF_FRAME: {
-      try
-      {
-        auto const tf_reference_utm = tf_buffer_->lookupTransform(utm_frame_, xy_reference_frame_, ros::Time(0));
-        setStatus(::rviz::StatusProperty::Ok, "XY Reference Transform", "Transform OK.");
-
-        try
-        {
-          // If UTM zone is set to be autodetected and detection has not yet been performed, do it now
-          if (utm_zone_ < GeographicLib::UTMUPS::MINZONE)
-          {
-            int zone;
-            bool northp;
-            double e, n;
-            GeographicLib::UTMUPS::Forward(msg->latitude, msg->longitude, zone, northp, e, n, utm_zone_);
-            utm_zone_property_->setValue(zone);
-            ROS_INFO("UTM zone has been automatically determined from NavSatFix message to %s.",
-                     GeographicLib::UTMUPS::EncodeZone(zone, northp).c_str());
+  // resolve pending tile requests, and set the received images as textures of their tiles
+  for (auto it = pending_tiles_.begin(); it != pending_tiles_.end(); ) {
+    try {
+      if (it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+          auto image = it->second.get();
+          auto tile_to_update = tiles_.find(it->first);
+          if (tile_to_update == tiles_.end()) {
+            // request was cleared since it was issued
+            continue;
           }
-
-          const auto& utm_coords = tf_reference_utm.transform.translation;
-          GeographicLib::UTMUPS::Reverse(utm_zone_, msg->latitude >= 0, utm_coords.x, utm_coords.y, reference_wgs.lat,
-                                         reference_wgs.lon, true);
-          setStatus(::rviz::StatusProperty::Ok, "XY reference UTM conversion", "UTM conversion OK.");
+          auto & tile_object = tile_to_update->second;
+          tile_object.updateData(image);
+          tile_object.setVisible(true);
+          // remove from pending requests
+          it = pending_tiles_.erase(it);
+        } catch (const tile_request_error & e) {
+          // log error and abort requests
+          RVIZ_COMMON_LOG_ERROR_STREAM("Tile request failed: " << e.what());
+          it = pending_tiles_.end();
+          setStatus(rviz_common::properties::StatusProperty::Error, TILE_REQUEST_STATUS, e.what());
+          // disable requests until tile server relevant properties change
+          tile_server_had_errors_ = true;
         }
-        catch (GeographicLib::GeographicErr& err)
-        {
-          setStatus(::rviz::StatusProperty::Error, "XY reference UTM conversion", QString::fromStdString(err.what()));
-          ROS_ERROR_THROTTLE(2.0, "%s", err.what());
-          return false;
-        }
+      } else {
+        // check next request
+        ++it;
       }
-      catch (tf2::TransformException const& ex)
-      {
-        setStatus(::rviz::StatusProperty::Error, "XY Reference Transform", QString::fromStdString(ex.what()));
-        ROS_ERROR_THROTTLE(2.0, "%s", ex.what());
-        return false;
-      }
-      break;
+    } catch (const std::future_error & e) {
+      RVIZ_COMMON_LOG_DEBUG_STREAM("Tile request destroyed before resolved: " << e.what());
+      it = pending_tiles_.erase(it);
     }
   }
- 
-  // check if update is necessary
-  TileCoordinate const tile_coordinates = fromWGSCoordinate<int>(reference_wgs, zoom_);
-  TileId const new_center_tile_id{ tile_url_, tile_coordinates, zoom_ };
-  bool const center_tile_changed = (!center_tile_ || !(new_center_tile_id == *center_tile_));
-
-  if (not center_tile_changed)
-  {
-    // TODO: Maybe we should update the transform here even if the center tile did not change?
-    // The localization might have been updated.
-    return false;
+  // if an error was just discovered
+  if (tile_server_had_errors_) {
+    pending_tiles_.clear();
+    tiles_.clear();
   }
 
-  ROS_DEBUG_NAMED("rviz_satellite", "Updating center tile to (%i, %i)", tile_coordinates.x, tile_coordinates.y);
+  if (!last_fix_) {
+    return;
+  }
+  if (tiles_.empty()) {
+    return;
+  }
 
-  center_tile_ = new_center_tile_id;
-  ref_coords_ = reference_wgs;
-  ref_fix_ = msg;
+  auto t = context_->getFrameManager()->getTime();
 
-  requestTileTextures();
-  transformTileToReferenceFrame();
-  return true;
+  Ogre::Vector3 _ignored_translation;
+  Ogre::Quaternion orientation_to_map = Ogre::Quaternion::IDENTITY;
+  try {
+    // get transformation of fixed frame to map, to set the aerial map orientation to be aligned with ENU
+    get_fixed_frame_transform_fallback_to_latest(
+      context_->getFrameManager(), MAP_FRAME, t, tf_tolerance(), _ignored_translation,
+      orientation_to_map);
+    setStatus(
+      rviz_common::properties::StatusProperty::Ok, ORIENTATION_STATUS,
+      "Map transform OK");
+  } catch (const rviz_common::transformation::FrameTransformerException & e) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Ok, TRANSFORM_STATUS, e.what());
+  }
+
+  Ogre::Vector3 sensor_translation;
+  Ogre::Quaternion _ignored_orientation;
+  try {
+    // get transformation of sensor frame
+    get_fixed_frame_transform_fallback_to_latest(
+      context_->getFrameManager(),
+      last_fix_->header.frame_id, t, tf_tolerance(), sensor_translation,
+      _ignored_orientation);
+    setStatus(rviz_common::properties::StatusProperty::Ok, TRANSFORM_STATUS, "Transform OK");
+  } catch (const rviz_common::transformation::FrameTransformerException & e) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, TRANSFORM_STATUS, e.what());
+    return;
+  }
+
+  // "example tile", since their zoom should be uniform
+  auto example_tile = tiles_.begin();
+  auto center_tile_offset = tileOffset(*last_fix_, example_tile->first.coord.z);
+  Ogre::Vector3 aerial_map_offset(center_tile_offset.x, -center_tile_offset.y, 0.0);
+
+  scene_node_->setPosition(
+    sensor_translation - orientation_to_map *
+    (aerial_map_offset * example_tile->second.tileSize()));
+  scene_node_->setOrientation(-orientation_to_map);
+
+  // update alpha here to account for changing age
+  updateAlpha(t);
 }
 
-void AerialMapDisplay::requestTileTextures()
+void AerialMapDisplay::resetMap()
 {
-  if (!isEnabled())
-  {
-    return;
-  }
-
-  if (tile_url_.empty())
-  {
-    setStatus(StatusProperty::Error, "TileRequest", "Tile URL is not set");
-    return;
-  }
-
-  if (not center_tile_)
-  {
-    setStatus(StatusProperty::Error, "Message", "No NavSatFix received yet");
-    return;
-  }
-
-  try
-  {
-    ROS_DEBUG_NAMED("rviz_satellite", "Requesting new tile images from the server");
-    tile_cache_.request({ *center_tile_, blocks_ });
-    triggerSceneAssembly();
-  }
-  catch (std::exception const& e)
-  {
-    setStatus(StatusProperty::Error, "TileRequest", QString(e.what()));
-    return;
-  }
+  const std::lock_guard<std::mutex> lock(tiles_mutex_);
+  tiles_.clear();
+  pending_tiles_.clear();
 }
 
-void AerialMapDisplay::checkRequestErrorRate()
+void AerialMapDisplay::resetTileServerError()
 {
-  // the following error rate thresholds are randomly chosen
-  float const error_rate = tile_cache_.getTileServerErrorRate(tile_url_);
-  if (error_rate > 0.95)
-  {
-    setStatus(StatusProperty::Level::Error, "TileRequest", "Few or no tiles received");
-  }
-  else if (error_rate > 0.3)
-  {
-    setStatus(StatusProperty::Level::Warn, "TileRequest",
-              "Not all requested tiles have been received. Possibly the server is throttling?");
-  }
-  else
-  {
-    setStatus(StatusProperty::Level::Ok, "TileRequest", "OK");
-  }
+  tile_server_had_errors_ = false;
+  setStatus(
+    rviz_common::properties::StatusProperty::Ok, TILE_REQUEST_STATUS,
+    "Last tile request OK");
 }
 
-void AerialMapDisplay::triggerSceneAssembly()
+void AerialMapDisplay::updateAlpha(const rclcpp::Time & t)
 {
-  ROS_DEBUG_NAMED("rviz_satellite", "Starting to repaint all tiles");
-  dirty_ = true;
-}
-
-void AerialMapDisplay::assembleScene()
-{
-  // TODO: split this function into pieces, and only call the pieces when needed
-  // E.g. into: grid geometry, tile geometry, material/texture (only this is asynchronous and depends on the incoming
-  // tiles from the cache/server)
-
-  if (!isEnabled() || !dirty_ || !center_tile_)
-  {
-    return;
-  }
-
-  if (objects_.empty())
-  {
-    ROS_ERROR_THROTTLE_NAMED(5, "rviz_satellite", "No objects to draw on, call createTileObjects() first!");
-    return;
-  }
-
-  dirty_ = false;
-
-  Area area(*center_tile_, blocks_);
-
-  TileCacheGuard guard(tile_cache_);
-
-  bool all_tiles_loaded = true;
-
-  auto it = objects_.begin();
-  for (int xx = area.left_top.x; xx <= area.right_bottom.x; ++xx)
-  {
-    for (int yy = area.left_top.y; yy <= area.right_bottom.y; ++yy)
-    {
-      auto obj = it->object;
-      auto& material = it->material;
-      assert(!material.isNull());
-      ++it;
-
-      TileId const to_find{ center_tile_->tile_server, { xx, yy }, center_tile_->zoom };
-
-      OgreTile const* tile = tile_cache_.ready(to_find);
-      if (!tile)
-      {
-        // don't show tiles with old textures
-        obj->setVisible(false);
-        all_tiles_loaded = false;
-        continue;
-      }
-
-      obj->setVisible(true);
-
-      // update texture
-      Ogre::TextureUnitState* tex_unit = material->getTechnique(0)->getPass(0)->getTextureUnitState(0);
-      tex_unit->setTextureName(tile->texture->getName());
-
-      // configure depth & alpha properties
-      if (alpha_ >= 0.9998)
-      {
-        material->setDepthWriteEnabled(!draw_under_);
-        material->setSceneBlending(Ogre::SBT_REPLACE);
-      }
-      else
-      {
-        material->setSceneBlending(Ogre::SBT_TRANSPARENT_ALPHA);
-        material->setDepthWriteEnabled(false);
-      }
-
-      if (draw_under_)
-      {
-        // render under everything else
-        obj->setRenderQueueGroup(Ogre::RENDER_QUEUE_3);
-      }
-      else
-      {
-        obj->setRenderQueueGroup(Ogre::RENDER_QUEUE_MAIN);
-      }
-
-      tex_unit->setAlphaOperation(Ogre::LBX_SOURCE1, Ogre::LBS_MANUAL, Ogre::LBS_CURRENT, alpha_);
-
-      // tile width/ height in meter
-      double const tile_w_h_m = getTileWH(ref_coords_->lat, zoom_);
-
-      // Note: In the following we will do two things:
-      //
-      // * We flip the position's y coordinate.
-      // * We flip the texture's v coordinate.
-      //
-      // For more explanation see the function transformAerialMap()
-
-      // The center tile has the coordinates left-bot = (0,0) and right-top = (1,1) in the AerialMap frame.
-      double const x = (xx - center_tile_->coord.x) * tile_w_h_m;
-      // flip the y coordinate because we need to flip the tiles to align the tile's frame with the ENU "map" frame
-      double const y = -(yy - center_tile_->coord.y) * tile_w_h_m;
-
-      // create a quad for this tile
-      // note: We have to recreate the vertices and cannot reuse the old vertices: tile_w_h_m depends on the latitude
-      obj->clear();
-
-      obj->begin(material->getName(), Ogre::RenderOperation::OT_TRIANGLE_LIST);
-
-      // We assign the Ogre texture coordinates in a way so that we flip the
-      // texture along the v coordinate. For example, we assign the bottom left
-      //
-      // Note that the Ogre texture coordinate system is: (0,0) = top left of the loaded image and (1,1) = bottom right
-      // of the loaded image
-
-      // bottom left
-      obj->position(x, y, 0.0f);
-      obj->textureCoord(0.0f, 0.0f);
-      obj->normal(0.0f, 0.0f, 1.0f);
-
-      // top right
-      obj->position(x + tile_w_h_m, y + tile_w_h_m, 0.0f);
-      obj->textureCoord(1.0f, 1.0f);
-      obj->normal(0.0f, 0.0f, 1.0f);
-
-      // top left
-      obj->position(x, y + tile_w_h_m, 0.0f);
-      obj->textureCoord(0.0f, 1.0f);
-      obj->normal(0.0f, 0.0f, 1.0f);
-
-      // bottom left
-      obj->position(x, y, 0.0f);
-      obj->textureCoord(0.0f, 0.0f);
-      obj->normal(0.0f, 0.0f, 1.0f);
-
-      // bottom right
-      obj->position(x + tile_w_h_m, y, 0.0f);
-      obj->textureCoord(1.0f, 0.0f);
-      obj->normal(0.0f, 0.0f, 1.0f);
-
-      // top right
-      obj->position(x + tile_w_h_m, y + tile_w_h_m, 0.0f);
-      obj->textureCoord(1.0f, 1.0f);
-      obj->normal(0.0f, 0.0f, 1.0f);
-
-      obj->end();
+  auto max_alpha = alpha_property_->getFloat();
+  float alpha = max_alpha;
+  if (last_fix_) {
+    // if message is displayed, fade it out according to configured timeout by reducing alpha
+    auto timeout_s = timeout_property_->getFloat();
+    if (std::abs(timeout_s) < std::numeric_limits<float>::epsilon()) {
+      alpha = max_alpha;
+    } else {
+      auto timeout = rclcpp::Duration(std::chrono::duration<double>(timeout_s));
+      auto age = t - last_fix_->header.stamp;
+      // age ratio is a value from 0 to 1, where 1 means timeout is reached
+      auto age_ratio = std::min(
+        1.0,
+        age.nanoseconds() / static_cast<double>(timeout.nanoseconds()));
+      // only start fading out from ratio 0.5 to 1
+      age_ratio = std::max(0.0, age_ratio - 0.5) * 2;
+      alpha = max_alpha * (1.0 - age_ratio);
     }
   }
-
-  // since not all tiles were loaded yet, this function has to be called again
-  if (!all_tiles_loaded)
-  {
-    dirty_ = true;
-  }
-  else
-  {
-    ROS_DEBUG_NAMED("rviz_satellite", "Finished assembling all tiles");
-  }
-
-  tile_cache_.purge({ *center_tile_, blocks_ });
-
-  checkRequestErrorRate();
-}
-
-void AerialMapDisplay::transformTileToReferenceFrame()
-{
-  switch (map_transform_type_)
-  {
-    case MapTransformType::VIA_MAP_FRAME:
-      transformTileToMapFrame();
-      break;
-    case MapTransformType::VIA_UTM_FRAME:
-      transformTileToUtmFrame();
-      break;
+  for (auto & tile : tiles_) {
+    tile.second.updateAlpha(alpha);
   }
 }
 
-void AerialMapDisplay::transformTileToMapFrame()
-{
-  if (!ref_fix_ or !center_tile_)
-  {
-    ROS_FATAL_THROTTLE_NAMED(2, "rviz_satellite", "ref_fix_ not set, can't create transforms");
-    return;
-  }
-
-  // We will use three frames in this function:
-  //
-  // * The frame from the NavSatFix message. It is rigidly attached to the robot.
-  // * The ENU world frame "map_frame_".
-  // * The frame of the tiles. We assume that the tiles are in a frame where x points eastwards and y southwards (ENU).
-  // This
-  //   frame is used by OSM and Google Maps, see https://en.wikipedia.org/wiki/Web_Mercator_projection and
-  //   https://developers.google.com/maps/documentation/javascript/coordinates.
-
-  // translation of NavSatFix frame w.r.t. the map frame
-  // NOTE: due to ENU convention, orientation is not needed, the tiles are rigidly attached to ENU
-  tf2::Vector3 t_navsat_map;
-
-  try
-  {
-    // Use a real TfBuffer for looking up this transform. The FrameManager only supplies transform to/from the
-    // currently selected RViz fixed-frame, which is of no help here.
-    auto const tf_navsat_map =
-        tf_buffer_->lookupTransform(map_frame_, ref_fix_->header.frame_id, ref_fix_->header.stamp);
-    tf2::fromMsg(tf_navsat_map.transform.translation, t_navsat_map);
-  }
-  catch (tf2::TransformException const& ex)
-  {
-    // retry the lookup after a while; we do not use the timeout parameter of lookupTransform() as that timeout is in
-    // ROS time and the waiting can freeze when ROS time is paused; this freeze would then freeze the whole Rviz UI
-    try
-    {
-      ros::WallDuration(0.01).sleep();
-      auto const tf_navsat_map =
-          tf_buffer_->lookupTransform(map_frame_, ref_fix_->header.frame_id, ref_fix_->header.stamp);
-      tf2::fromMsg(tf_navsat_map.transform.translation, t_navsat_map);
-    }
-    catch (tf2::TransformException const& ex)
-    {
-      setStatus(StatusProperty::Error, "Transform", QString::fromStdString(ex.what()));
-      return;
-    }
-  }
-
-  // FIXME: note the <double> template! this is different from center_tile_.coord, otherwise we could just use that
-  // since center_tile_ and ref_fix_ are in sync
-  auto const ref_fix_tile_coords = fromWGSCoordinate<double>(*ref_coords_, zoom_);
-
-  // In assembleScene() we shift the AerialMap so that the center tile's left-bottom corner has the coordinate (0,0).
-  // Therefore we can calculate the NavSatFix coordinate (in the AerialMap frame) by just looking at the fractional part
-  // of the coordinate. That is we calculate the offset from the left bottom corner of the center tile.
-  auto const center_tile_offset_x = ref_fix_tile_coords.x - std::floor(ref_fix_tile_coords.x);
-  // In assembleScene() the tiles are created so that the texture is flipped along the y coordinate. Since we want to
-  // calculate the positions of the center tile, we also need to flip the texture's v coordinate here.
-  auto const center_tile_offset_y = 1 - (ref_fix_tile_coords.y - std::floor(ref_fix_tile_coords.y));
-
-  double const tile_w_h_m = getTileWH(ref_coords_->lat, zoom_);
-  ROS_DEBUG_NAMED("rviz_satellite", "Tile resolution is %.1fm", tile_w_h_m);
-
-  // translation of the center-tile w.r.t. the NavSatFix frame
-  tf2::Vector3 t_centertile_navsat = { center_tile_offset_x * tile_w_h_m, center_tile_offset_y * tile_w_h_m, 0 };
-
-  center_tile_pose_.header.frame_id = map_frame_;
-  center_tile_pose_.header.stamp = ref_fix_->header.stamp;
-  tf2::toMsg(t_navsat_map - t_centertile_navsat, center_tile_pose_.pose.position);
+rclcpp::Duration AerialMapDisplay::tf_tolerance() const {
+  auto tf_tolerance_sec = tf_tolerance_property_->getFloat();
+  return rclcpp::Duration(std::chrono::duration<double>(tf_tolerance_sec));
 }
 
-void AerialMapDisplay::transformTileToUtmFrame()
+TileCoordinate AerialMapDisplay::centerTile() const
 {
-  if (!ref_fix_ or !center_tile_)
-  {
-    ROS_FATAL_THROTTLE_NAMED(2, "rviz_satellite", "ref_fix_ not set, can't create transforms");
-    return;
-  }
-  
-  // tile ID (integer x/y/zoom) corresponding to the downloaded tile / navsat message
-  auto const tile = fromWGSCoordinate<int>(*ref_coords_, zoom_);
-  
-  // Latitude and longitude of this tile's origin
-  auto const tileWGS = toWGSCoordinate<int>(tile, zoom_);
-
-  // Tile's origin in UTM coordinates
-  double northing, easting;
-  int utm_zone;
-  bool northp;
-
-  try
-  {
-    GeographicLib::UTMUPS::Forward(tileWGS.lat, tileWGS.lon, utm_zone, northp, easting, northing, utm_zone_);
-  }
-  catch (GeographicLib::GeographicErr& err)
-  {
-    ROS_ERROR_THROTTLE(2.0, "Error transforming lat-lon to UTM: %s", err.what());
-    if (utm_zone_ != GeographicLib::UTMUPS::STANDARD)
-    {
-      try
-      {
-        GeographicLib::UTMUPS::Forward(tileWGS.lat, tileWGS.lon, utm_zone, northp, easting, northing,
-                                       GeographicLib::UTMUPS::STANDARD);
-        ROS_INFO_THROTTLE(2.0, "Trying to autodetect UTM zone instead of using zone %i", utm_zone_);
-      }
-      catch (GeographicLib::GeographicErr& err)
-      {
-        setStatus(::rviz::StatusProperty::Error, "UTM", QString::fromStdString(err.what()));
-        return;
-      }
-    }
-    else
-    {
-      setStatus(::rviz::StatusProperty::Error, "UTM", QString::fromStdString(err.what()));
-      return;
-    }
-  }
-  
-  setStatus(::rviz::StatusProperty::Ok, "UTM", "Conversion from lat/lon to UTM is OK.");
-
-  if (utm_zone != utm_zone_)
-  {
-    ROS_INFO("UTM zone has been updated to %s.", GeographicLib::UTMUPS::EncodeZone(utm_zone, northp).c_str());
-    utm_zone_property_->setInt(utm_zone);
-  }
-
-  center_tile_pose_.header.stamp = ref_fix_->header.stamp;
-  center_tile_pose_.header.frame_id = utm_frame_;
-  center_tile_pose_.pose.position.x = easting;
-  center_tile_pose_.pose.position.y = northing;
-
-  switch (z_reference_type_)
-  {
-    case PositionReferenceType::NAV_SAT_FIX_MESSAGE:
-      center_tile_pose_.pose.position.z = ref_fix_->altitude;
-      break;
-    case PositionReferenceType::TF_FRAME:
-      if (z_reference_frame_ == utm_frame_)
-      {
-        center_tile_pose_.pose.position.z = 0;
-        setStatus(StatusProperty::Ok, "Z Reference Transform", "Transform OK.");
-      }
-      else
-      {
-        try
-        {
-          auto const tf_reference_utm =
-              tf_buffer_->lookupTransform(utm_frame_, z_reference_frame_, ros::Time(0));
-          center_tile_pose_.pose.position.z = tf_reference_utm.transform.translation.z;
-          setStatus(StatusProperty::Ok, "Z Reference Transform", "Transform OK.");
-        }
-        catch (tf2::TransformException const& ex)
-        {
-          setStatus(StatusProperty::Error, "Z Reference Transform", QString::fromStdString(ex.what()));
-        }
-      }
-      break;
-  }
-}
-
-void AerialMapDisplay::tfReferencePeriodicUpdate(const ros::TimerEvent&)
-{
-  if (map_transform_type_ != MapTransformType::VIA_UTM_FRAME || xy_reference_type_ != PositionReferenceType::TF_FRAME)
-  {
-    return;
-  }
-  
-  if (!ref_fix_ || !center_tile_)
-  {
-    return;
-  }
-
-  try
-  {
-    auto const tf_reference_utm =
-        tf_buffer_->lookupTransform(utm_frame_, xy_reference_frame_, ros::Time(0));
-    setStatus(::rviz::StatusProperty::Ok, "XY Reference Transform", "Transform OK.");
-    
-    try
-    {
-      WGSCoordinate reference_wgs{};
-      const auto& utm_coords = tf_reference_utm.transform.translation;
-      GeographicLib::UTMUPS::Reverse(utm_zone_, ref_fix_->latitude >= 0, utm_coords.x, utm_coords.y, reference_wgs.lat,
-                                     reference_wgs.lon, true);
-      setStatus(::rviz::StatusProperty::Ok, "XY reference UTM conversion", "UTM conversion OK.");
-
-      auto new_fix = boost::make_shared<sensor_msgs::NavSatFix>();
-      *new_fix = *ref_fix_;
-      new_fix->header.stamp = ros::Time::now();
-      new_fix->latitude = reference_wgs.lat;
-      new_fix->longitude = reference_wgs.lon;
-      new_fix->altitude = utm_coords.z;
-
-      // update the center tile; if it stays the same, at least update the transforms so that z reference is updated
-      if (!updateCenterTile(new_fix))
-      {
-        transformTileToReferenceFrame();
-      }
-      
-      setStatus(StatusProperty::Ok, "Message", "Position reference updated.");
-    }
-    catch (GeographicLib::GeographicErr& err)
-    {
-      setStatus(::rviz::StatusProperty::Error, "XY reference UTM conversion", QString::fromStdString(err.what()));
-      ROS_ERROR_THROTTLE(2.0, "%s", err.what());
-      return;
-    }
-  }
-  catch (tf2::TransformException const& ex)
-  {
-    setStatus(::rviz::StatusProperty::Error, "XY Reference Transform", QString::fromStdString(ex.what()));
-    ROS_ERROR_THROTTLE(2.0, "%s", ex.what());
-    return;
-  }
-}
-
-void AerialMapDisplay::transformMapTileToFixedFrame()
-{
-  // orientation of the tile w.r.t. the fixed-frame
-  Ogre::Quaternion o_centertile_fixed;
-  // translation of the tile w.r.t. the fixed-frame
-  Ogre::Vector3 t_centertile_fixed;
-
-  auto header = center_tile_pose_.header;
-  header.stamp = ros::Time::now();
-  const auto& frame_name = header.frame_id;
-  
-  auto tile_pose = center_tile_pose_.pose;
-  if (z_offset_ != 0.0)
-  {
-    tile_pose.position.z += z_offset_;
-  }
-  
-  // transform the tile origin to fixed frame
-  if (context_->getFrameManager()->transform(header, tile_pose, t_centertile_fixed, o_centertile_fixed))
-  {
-    setStatus(::rviz::StatusProperty::Ok, "Transform", "Transform OK");
-
-    scene_node_->setPosition(t_centertile_fixed);
-    scene_node_->setOrientation(o_centertile_fixed);
-  }
-  else
-  {
-    // display error
-    std::string error;
-    if (context_->getFrameManager()->transformHasProblems(frame_name, ros::Time(), error))
-    {
-      setStatus(::rviz::StatusProperty::Error, "Transform", QString::fromStdString(error));
-    }
-    else
-    {
-      setStatus(::rviz::StatusProperty::Error, "Transform",
-                QString::fromStdString("Could not transform from [" + frame_name + "] to Fixed Frame [" +
-                                       fixed_frame_.toStdString() + "] for an unknown reason"));
-    }
-  }
+  // when calling this function internally, the tiles must already be created
+  // they must also always have an uneven count, since the center tile is surrounded by a field of
+  // an uneven number of sides; thus, there is a clear center tile
+  assert(!tiles_.empty());
+  assert((tiles_.size() % 2) == 1);
+  auto it = tiles_.begin();
+  std::advance(it, tiles_.size() / 2);
+  return it->first.coord;
 }
 
 void AerialMapDisplay::reset()
 {
-  Display::reset();
-  // unsubscribe, clear, resubscribe
-  updateTopic();
+  RTDClass::reset();
+  resetMap();
+  last_fix_.reset();
+  resetTileServerError();
 }
 
-}  // namespace rviz
+}  // namespace rviz_satellite
 
-#include <pluginlib/class_list_macros.h>
-PLUGINLIB_EXPORT_CLASS(rviz::AerialMapDisplay, rviz::Display)
+#include <pluginlib/class_list_macros.hpp>  // NOLINT
+PLUGINLIB_EXPORT_CLASS(rviz_satellite::AerialMapDisplay, rviz_common::Display)
