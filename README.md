@@ -23,6 +23,8 @@ You can edit the longitude and latitude values in `launch/demo.gps` to change th
 
 Check the Usage section below to learn how to use the position of your robot and a satellite map.
 
+See demo file `launch/demo_utm.launch` for an example of using this plugin in the `UTM frame` mode (see below).
+
 ## Usage
 
 Add an instance of `AerialMapDisplay` to your rviz config.
@@ -34,6 +36,18 @@ At present the cache does not expire automatically - you should delete the files
 
 Currently, we only support the [OpenStreetMap](http://wiki.openstreetmap.org/wiki/Slippy_map_tilenames) convention for tile URLs.
 This e.g. implies that only raster tiles (no vector tiles) are supported.
+
+Transformation of tiles to RViz fixed frame can be done in two ways that are configured using `Map Transform Type` option:
+
+1. Specify a `Map frame`, which is an ENU-oriented frame in which your robot localizes. This mode expects that the frame
+   of the subscribed `NavSatFix` messages is consistent with the measured latitude/longitude in this map frame.
+   In this mode, the tiles go through an intermediate transform to the map frame.
+2. Specify `UTM frame` (and possibly `UTM zone`). In this mode, no map frame is required and the tiles are directly 
+   placed on their UTM positions. This mode expects UTM frame is represented in your transform tree. The subscribed
+   `NavSatFix` messages are only used to determine the tiles to download, so small inconsistencies between the
+   `NavSatFix` frame and the measured latitude/longitude is not a big problem. In this mode, you can also change the
+   XY and Z position references from the `NavSatFix` message to a TF frame. This means the point around which the tiles
+   are displayed is determined by UTM pose of the specified frame instead of the `NavSatFix` messages.
 
 ## Tile servers
 
@@ -55,10 +69,28 @@ Please refer to the respective terms of service and copyrights.
 ## Options
 
 - `Topic` is the topic of the GPS measurements.
+- `Map Transform Type` selects between the `Map frame` mode and `UTM frame` mode (see section `Usage`).
 - `Alpha` is simply the display transparency.
 - `Draw Under` will cause the map to be displayed below all other geometry.
 - `Zoom` is the zoom level of the map. Recommended values are 16-19, as anything smaller is _very_ low resolution. 22 is the current max.
 - `Blocks` number of adjacent blocks to load. rviz_satellite will load the central block, and this many blocks around the center. 8 is the current max.
+- `Z Offset` specifies offset of the displayed tiles in the Z coordinate from their default pose (in meters).
+
+### Options available in `Map frame` mode
+- `Map Frame` is the map frame rigidly attached to the world with ENU convention.
+
+### Options available in `UTM frame` mode
+
+- `UTM Frame` is the frame that represents UTM coordinate frame.
+- `UTM Zone` is the zone used by the `UTM frame`. Value `-1` triggers autodetection of zone and this property is then
+  overridden with the autodetected zone.
+- `XY Position Reference` specifies how to determine the point around which tiles are centered. It can be either `<NavSatFix Message>`,
+  which uses global coordinates from the received fix messages. Or it can be a TF frame name. In such case, the tiles are
+  centered around the XY position of the specified frame in UTM coordinates.
+  - Please note that selecting the UTM frame for this reference is invalid. Position of the UTM frame in UTM is `(0, 0)`, which is
+    an invalid UTM coordinate (supported range is 100 km - 900 km in most zones).
+- `Z Position Reference` specifies how to determine the Z coordinate of the displayed tiles. The meaning of the values is similar
+  to `XY Position Reference`. `Z Offset` is applied after computing the reference height.
 
 ## Support and Contributions
 
