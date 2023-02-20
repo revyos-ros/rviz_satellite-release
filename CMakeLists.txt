@@ -6,6 +6,8 @@ find_package(catkin REQUIRED
     roscpp
     rviz
     sensor_msgs
+    tf2
+    tf2_geometry_msgs
 )
 
 catkin_package(
@@ -13,10 +15,15 @@ catkin_package(
     roscpp
     rviz
     sensor_msgs
+    tf2
 )
 
 find_package(Qt5 ${rviz_QT_VERSION} EXACT REQUIRED Core Gui Network REQUIRED)
 set(QT_LIBRARIES Qt5::Core Qt5::Gui Qt5::Network)
+
+# Ubuntu libgeographic-dev package installs into non-standard location
+set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};/usr/share/cmake/geographiclib")
+find_package(GeographicLib REQUIRED)
 
 
 ## BUILD ##
@@ -24,12 +31,14 @@ set(QT_LIBRARIES Qt5::Core Qt5::Gui Qt5::Network)
 set(${PROJECT_NAME}_SOURCES
   src/aerialmap_display.cpp
   src/ogre_tile.cpp
+  src/position_reference_property.cpp
   src/tile_id.cpp
 )
 
 set(${PROJECT_NAME}_HEADERS
   src/aerialmap_display.h
   src/detail/tile_downloader.h
+  src/position_reference_property.h
 )
 
 # invoke MOC and UI/ include Qt headers/ link Qt libraries - alternatively, see CMAKE_AUTOMOC
@@ -62,6 +71,7 @@ target_link_libraries(
   ${PROJECT_NAME}
   ${QT_LIBRARIES}
   ${catkin_LIBRARIES}
+  ${GeographicLib_LIBRARIES}
 )
 
 
