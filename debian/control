@@ -1,0 +1,12 @@
+Source: ros-noetic-rviz-satellite
+Section: misc
+Priority: optional
+Maintainer: Tim Clephas <tim.clephas@nobleo.nl>
+Build-Depends: debhelper (>= 9.0.0), libgeographic-dev, qtbase5-dev, ros-noetic-catkin, ros-noetic-roscpp, ros-noetic-rviz, ros-noetic-sensor-msgs, ros-noetic-tf2, ros-noetic-tf2-geometry-msgs
+Homepage: https://github.com/nobleo/rviz_satellite
+Standards-Version: 3.9.2
+
+Package: ros-noetic-rviz-satellite
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libgeographic-dev, ros-noetic-roscpp, ros-noetic-rviz, ros-noetic-sensor-msgs, ros-noetic-tf2, ros-noetic-tf2-ros
+Description: Display satellite map tiles in RViz
