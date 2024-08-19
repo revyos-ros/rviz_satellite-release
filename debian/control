@@ -1,0 +1,12 @@
+Source: ros-humble-rviz-satellite
+Section: misc
+Priority: optional
+Maintainer: Andre Schröder <andre.schroeder@tomtom.com>
+Build-Depends: debhelper (>= 9.0.0), qtbase5-dev, ros-humble-ament-cmake, ros-humble-ament-cmake-gtest <!nocheck>, ros-humble-ament-lint-auto <!nocheck>, ros-humble-ament-lint-common <!nocheck>, ros-humble-angles, ros-humble-rclcpp, ros-humble-rcpputils, ros-humble-rviz-common, ros-humble-rviz-default-plugins, ros-humble-sensor-msgs, ros-humble-tf2-ros, ros-humble-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-humble-rviz-satellite
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-humble-angles, ros-humble-rclcpp, ros-humble-rcpputils, ros-humble-rviz-common, ros-humble-rviz-default-plugins, ros-humble-sensor-msgs, ros-humble-tf2-ros, ros-humble-ros-workspace
+Description: Display satellite map tiles in RViz
