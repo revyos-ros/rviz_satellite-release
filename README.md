@@ -2,6 +2,8 @@
 
 Rviz plugin for displaying satellite maps at the position of a `sensor_msgs/msg/NavSatFix` message.
 
+> **_NOTE:_**  Looking for the ROS1 version? Checkout the ros1 branch!
+
 ## Usage
 
 Add an instance of `AerialMap` to your Rviz config and point it to a `sensor_msgs/msg/NavSatFix` topic.
@@ -29,6 +31,10 @@ You must provide a tile URL (Object URI) from which the satellite images are loa
 The URL should have the form `http://server.tld/{z}/{x}/{y}.jpg`.
 Where the tokens `{z}`, `{x}`, `{y}` represent the zoom level, x coordinate, and y coordinate respectively.
 These will automatically be substituted by rviz_satellite when making HTTP requests.
+
+Tiles can optionally be loaded from a local filesystem if downloaded beforehand
+for cases where robots do not have internet access. For example, the file URI
+`file:///tmp/tile/{z}/{y}/{x}.jpg` can be used to load files from the `/tmp/tile` directory.
 
 rviz_satellite doesn't come with any preconfigured tile URL.
 For example, you could use one of the following tile servers:
